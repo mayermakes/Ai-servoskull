@@ -1,0 +1,16 @@
+# Core dependencies for servoskull.py on Raspberry Pi 5
+# Install with: pip install -r requirements.txt
+
+# Camera and image processing
+picamera2>=0.3.14
+opencv-python>=4.8.0
+
+# Hardware control
+RPi.GPIO>=0.7.0
+pi5neo>=0.1.0
+
+# Hailo inference (note: Hailo runtime/device bindings typically come pre-installed on RPi with Hailo)
+# If needed, install from Hailo's official repository
+# hailo-pyhrt>=4.0.0
+
+# Standard library is sufficient for the rest (argparse, threading, time, math, queue)
