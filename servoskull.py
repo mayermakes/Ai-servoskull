@@ -19,6 +19,7 @@ from libcamera import Transform
 # Position (x, y) of the current object of interest (closest object).
 # Will be updated each frame by draw_objects. None when no detections.
 Object_of_interest_pos = None
+Object_of_interest_class = None  # 'person', 'keyboard', 'laptop', or None
 
 # Servo configuration (adjust pins to your wiring)
 PAN_GPIO = 17    # GPIO pin for pan servo (BCM numbering)
@@ -44,8 +45,9 @@ EXTREME_MARGIN_RATIO = 0.02
 SERVO_UPDATE_MS_DEFAULT = 60.0
 
 # Jaw control
-JAW_OPEN = 175.0  # degrees for open jaw
-JAW_CLOSED = 5.0 # degrees for closed jaw
+JAW_CLOSED = 5.0      # degrees for closed jaw
+JAW_PERSON = 90.0     # degrees for person detection
+JAW_DEVICE = 175.0    # degrees for keyboard/laptop detection
 
 # NeoPixel LED ring configuration for Pi5Neo
 LED_SPI_DEV = '/dev/spidev0.0'  # SPI device for Pi5Neo
@@ -53,31 +55,37 @@ LED_COUNT = 12                   # Number of LEDs in the ring
 LED_SPEED = 800              # SPI clock frequency
 # Colors in RGB format (note: Pi5Neo uses RGB order)
 LED_COLOR_OFF = (0, 0, 0)
-LED_COLOR_GREEN = (0, 255, 0)  # For person detection
-LED_COLOR_RED = (255, 0, 0)    # For laptop/keyboard detection
-LED_UPDATE_INTERVAL = 0.5     # seconds between actual LED hardware updates
+LED_COLOR_GREEN = (0, 255, 0)   # For person detection
+LED_COLOR_RED = (255, 0, 0)     # For laptop/keyboard detection
+LED_COLOR_BLUE = (0, 0, 255)    # For other object detections
+LED_UPDATE_INTERVAL = 0.5       # seconds between actual LED hardware updates
+
+# LED mode: 'brightness' (proportional to confidence) or 'multi' (one LED per detection)
+LED_MODE = 'brightness'
 
 
 class NeoPixelRing:
     """Threaded controller for a NeoPixel ring using Pi5Neo.
 
-    Public API matches previous class: show_detection(class, confidence), clear(), cleanup().
+    Public API: show_detection(class, confidence), show_detections_multi(detection_list), clear(), cleanup().
     Internally a worker thread processes requests so LED updates run independently.
     """
 
-    def __init__(self, spi_dev=LED_SPI_DEV, num_pixels=LED_COUNT, speed=LED_SPEED):
+    def __init__(self, spi_dev=LED_SPI_DEV, num_pixels=LED_COUNT, speed=LED_SPEED, mode='brightness'):
         self._pixels = Pi5Neo(spi_dev, num_pixels, speed)
         self.num_pixels = num_pixels
         self.active_leds = 0
         self.current_color = LED_COLOR_OFF
+        self.mode = mode  # 'brightness' or 'multi'
 
-        # Queue of pending operations: ('show', label, confidence) or ('clear',)
+        # Queue of pending operations: ('show', label, confidence), ('show_multi', detection_list), or ('clear',)
         self._q = queue.Queue()
         self._running = True
         self._thread = threading.Thread(target=self._worker, daemon=True)
         self._thread.start()
 
-    def _apply_buffer(self, label, confidence):
+    def _apply_buffer_brightness(self, label, confidence):
+        """Brightness mode: single color, LED count based on confidence."""
         # choose color
         if label == 'person':
             color = LED_COLOR_GREEN
@@ -96,6 +104,29 @@ class NeoPixelRing:
         self._pixels.update_strip()
         self.active_leds = num_leds
         self.current_color = color
+
+    def _apply_buffer_multi(self, detection_list):
+        """Multi mode: each detection gets one LED in its corresponding color."""
+        # detection_list is a list of (label, confidence) tuples
+        # Order: person=green, laptop/keyboard=red, others=blue
+        led_idx = 0
+        for label, _ in detection_list:
+            if led_idx >= self.num_pixels:
+                break
+            if label == 'person':
+                self._pixels.set_led_color(led_idx, *LED_COLOR_GREEN)
+            elif label in ('laptop', 'keyboard'):
+                self._pixels.set_led_color(led_idx, *LED_COLOR_RED)
+            else:
+                self._pixels.set_led_color(led_idx, *LED_COLOR_BLUE)
+            led_idx += 1
+
+        # Turn off remaining LEDs
+        for i in range(led_idx, self.num_pixels):
+            self._pixels.set_led_color(i, *LED_COLOR_OFF)
+
+        self._pixels.update_strip()
+        self.active_leds = led_idx
 
     def _worker(self):
         # worker loop drains the queue and applies the most recent command
@@ -125,12 +156,22 @@ class NeoPixelRing:
                 self.current_color = LED_COLOR_OFF
             elif latest[0] == 'show':
                 _, label, confidence = latest
-                self._apply_buffer(label, confidence)
+                self._apply_buffer_brightness(label, confidence)
+            elif latest[0] == 'show_multi':
+                _, detection_list = latest
+                self._apply_buffer_multi(detection_list)
 
     def show_detection(self, detected_class, confidence):
-        # enqueue show request
+        """Brightness mode: show single detection."""
         try:
             self._q.put_nowait(('show', detected_class, confidence))
+        except Exception:
+            pass
+
+    def show_detections_multi(self, detection_list):
+        """Multi mode: show multiple detections, one LED per detection."""
+        try:
+            self._q.put_nowait(('show_multi', detection_list))
         except Exception:
             pass
 
@@ -306,7 +347,7 @@ class ServoController:
                 if self.pan_in_deadzone:
                     desired_pan = self.current_pan
                 else:
-                    desired_pan = 90.0 - dx * PAN_K
+                    desired_pan = 90.0 + dx * PAN_K
 
             # Tilt axis
             if cy <= extreme_y_top:
@@ -326,7 +367,7 @@ class ServoController:
                 if self.tilt_in_deadzone:
                     desired_tilt = self.current_tilt
                 else:
-                    desired_tilt = 90.0 + dy * TILT_K
+                    desired_tilt = 90.0 - dy * TILT_K
 
             # Clamp
             desired_pan = max(self.min_angle, min(self.max_angle, desired_pan))
@@ -336,8 +377,14 @@ class ServoController:
             self.current_pan += (desired_pan - self.current_pan) * self.smoothing
             self.current_tilt += (desired_tilt - self.current_tilt) * self.smoothing
 
-            # Set jaw position based on whether we have a target
-            desired_jaw = JAW_OPEN if pos is not None else JAW_CLOSED
+            # Set jaw position based on detected class
+            global Object_of_interest_class
+            if Object_of_interest_class == 'person':
+                desired_jaw = JAW_PERSON
+            elif Object_of_interest_class in ('keyboard', 'laptop'):
+                desired_jaw = JAW_DEVICE
+            else:
+                desired_jaw = JAW_CLOSED
             # Smooth jaw
             self.current_jaw += (desired_jaw - self.current_jaw) * self.smoothing
 
@@ -394,40 +441,66 @@ def extract_detections(hailo_output, w, h, class_names, threshold=0.5):
 
 
 def draw_objects(request):
-    global Object_of_interest_pos, detections, led_ring
+    global Object_of_interest_pos, Object_of_interest_class, detections, led_ring
     # read latest detections (may be None)
     current_detections = detections or []
     # Default to None each frame; will set to (x, y) of chosen object if any.
     Object_of_interest_pos = None
+    Object_of_interest_class = None
 
-    # Update LED ring based on detections (robust matching)
+    # Update LED ring based on detections and mode
     if led_ring is not None:
-        best_detection = None
-        best_conf = 0.0
-        best_label = None
-        for det in current_detections:
-            class_name, _, conf = det
-            if not isinstance(class_name, str):
-                continue
-            name = class_name.lower()
-            # match person, laptop or keyboard by substring to be tolerant
-            if ('person' in name) or ('laptop' in name) or ('keyboard' in name):
-                if conf > best_conf:
-                    best_conf = conf
-                    best_detection = det
-                    if 'person' in name:
-                        best_label = 'person'
-                    elif 'laptop' in name:
-                        best_label = 'laptop'
-                    elif 'keyboard' in name:
-                        best_label = 'keyboard'
-
-        if best_detection is not None and best_label is not None:
-            # clamp confidence
-            conf = max(0.0, min(1.0, float(best_conf)))
-            led_ring.show_detection(best_label, conf)
+        if led_ring.mode == 'multi':
+            # Multi mode: collect all relevant detections
+            detection_list = []
+            for det in current_detections:
+                class_name, _, conf = det
+                if not isinstance(class_name, str):
+                    continue
+                name = class_name.lower()
+                # Include all detections: person, keyboard, laptop, and others
+                if 'person' in name:
+                    detection_list.append(('person', conf))
+                elif 'laptop' in name:
+                    detection_list.append(('laptop', conf))
+                elif 'keyboard' in name:
+                    detection_list.append(('keyboard', conf))
+                else:
+                    # Other objects get blue LED
+                    detection_list.append(('other', conf))
+            
+            if detection_list:
+                led_ring.show_detections_multi(detection_list)
+            else:
+                led_ring.clear()
         else:
-            led_ring.clear()
+            # Brightness mode: find best detection among person/keyboard/laptop
+            best_detection = None
+            best_conf = 0.0
+            best_label = None
+            for det in current_detections:
+                class_name, _, conf = det
+                if not isinstance(class_name, str):
+                    continue
+                name = class_name.lower()
+                # match person, laptop or keyboard by substring to be tolerant
+                if ('person' in name) or ('laptop' in name) or ('keyboard' in name):
+                    if conf > best_conf:
+                        best_conf = conf
+                        best_detection = det
+                        if 'person' in name:
+                            best_label = 'person'
+                        elif 'laptop' in name:
+                            best_label = 'laptop'
+                        elif 'keyboard' in name:
+                            best_label = 'keyboard'
+
+            if best_detection is not None and best_label is not None:
+                # clamp confidence
+                conf = max(0.0, min(1.0, float(best_conf)))
+                led_ring.show_detection(best_label, conf)
+            else:
+                led_ring.clear()
 
     if current_detections:
         # Choose the "closest" object as the one with the largest bounding-box area.
@@ -462,6 +535,16 @@ def draw_objects(request):
                 # Red in BGR with 4 channels (XRGB8888) -> (0,0,255,0)
                 cv2.circle(m.array, (cx, cy), 6, (0, 0, 255, 0), -1, cv2.LINE_AA)
                 Object_of_interest_pos = (cx, cy)
+                # Set the class of the best object (closest)
+                best_class_name = current_detections[best_idx][0]
+                if isinstance(best_class_name, str):
+                    name_lower = best_class_name.lower()
+                    if 'person' in name_lower:
+                        Object_of_interest_class = 'person'
+                    elif 'laptop' in name_lower:
+                        Object_of_interest_class = 'laptop'
+                    elif 'keyboard' in name_lower:
+                        Object_of_interest_class = 'keyboard'
 
 if __name__ == "__main__":
     # Parse command-line arguments.
@@ -476,6 +559,8 @@ if __name__ == "__main__":
                         help="Enable debug output (servo angles, object position, LED state)")
     parser.add_argument("--servo-update-ms", type=float, default=SERVO_UPDATE_MS_DEFAULT,
                         help="Servo update period in milliseconds (minimum 10 ms).")
+    parser.add_argument("--led-mode", choices=['brightness', 'multi'], default='brightness',
+                        help="LED display mode: 'brightness' (confidence-based) or 'multi' (one LED per detection with colors)")
     args = parser.parse_args()
 
     # Get the Hailo model, the input size it wants, and the size of our preview stream.
@@ -490,7 +575,7 @@ if __name__ == "__main__":
         # Initialize LED ring
         global led_ring
         try:
-            led_ring = NeoPixelRing()
+            led_ring = NeoPixelRing(mode=args.led_mode)
         except Exception as e:
             print(f"Warning: Could not initialize LED ring: {e}")
             led_ring = None
