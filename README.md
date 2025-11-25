@@ -18,3 +18,9 @@ i wanted to give it a voice as well but even tinyllama does not run fast enough 
 maybe later.
 the code is a mess so don´t judge me i had to gett this thing working in time.
 
+Usage:
+start with:
+python3 servoskull.py                    # normal mode - led amount shows percentage of certainty and color signifies type of object
+python3 servoskull.py -d                 #Debugging output in terminal
+python3 servoskull.py --led-mode multi   #counting mode, each led signals a detected object instance)
+
